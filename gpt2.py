@@ -103,7 +103,8 @@ class GPT2(nn.Module):
         return x
 
 
-def main(args):
+def main():
+    batch_size = 1
     seq_len = 128
     n_layers = 2
     vocab_size = 30000
@@ -116,21 +117,12 @@ def main(args):
     with open('./data.txt', 'r') as f:
         text = f.read()
     tokenized = tokenizer.encode(text)
-
-    batches = []
-    for i in tqdm(range(0, len(tokenized.tokens)-129, 129)):
-        batch = tokenized.ids[i:i+129]
-        batches.append(batch)
-
-        if i > 129*100:
-            break
-    batches = jnp.array(batches)
+    batches = jnp.array(tokenized.ids)
 
     rng = jax.random.PRNGKey(42)
-    # x = jax.random.randint(rng, (args.batch_size, seq_len), 0, 1000, jnp.int32)
 
     variables = GPT2(seq_len, n_layers, vocab_size, d_model, n_heads).init(
-        {'params': rng, 'dropout': rng}, batches[:1, :128], training=False)
+        {'params': rng, 'dropout': rng}, batches[:128].reshape(1, 128), training=False)
     gpt2 = GPT2(seq_len, n_layers, vocab_size, d_model, n_heads)
 
     def loss_fn(variables, batch, rng):
@@ -161,20 +153,19 @@ def main(args):
         learning_rate=1e-4, beta1=0.5, beta2=0.9).create(variables)
     optimizer = flax.jax_utils.replicate(optimizer)
 
-    # batch = jax.random.randint(
-    #     rng, (args.batch_size, seq_len + 1), 0, 1000, jnp.int32)
-
     rngs = jax.random.split(rng, num=jax.local_device_count())
 
     global_step = 0
     for _ in range(1):
-        for i in tqdm(range(batches.shape[0] // args.batch_size)):
-            batch = batches[i:i+args.batch_size]
+        for i in tqdm(range(0, batches.shape[0] // ((seq_len+1)*batch_size))):
+            batch = batches[i*(seq_len+1)*batch_size:(i+1)
+                            * (seq_len+1)*batch_size].reshape(-1, seq_len+1)
+
             x = shard(batch)
 
             optimizer, loss, rngs = train_step(optimizer, x, rngs)
 
-            if global_step % 2 == 0:
+            if global_step % 10 == 0:
                 loss = flax.jax_utils.unreplicate(loss)
                 print(loss)
 
@@ -184,12 +175,12 @@ def main(args):
     batch = flax.jax_utils.unreplicate(x)
 
     logits = gpt2.apply(
-        optimizer.target, batch[:, :-1], training=True, rngs={'dropout': rng})
+        optimizer.target, batches[:seq_len].reshape(1, seq_len), training=True, rngs={'dropout': rng})
     preds = jnp.argmax(nn.softmax(logits, axis=-1), axis=-1)
 
-    print(batch[:, 1:])
+    print(tokenizer.decode(batches[:seq_len]))
     print("\n")
-    print(preds)
+    print(tokenizer.decode(preds.reshape(-1)))
 
 
 if __name__ == "__main__":
@@ -208,4 +199,4 @@ if __name__ == "__main__":
         ptvsd.wait_for_attach()
         breakpoint()
 
-    main(args)
+    main()
