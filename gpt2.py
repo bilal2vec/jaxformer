@@ -1,4 +1,5 @@
 import argparse
+from functools import partial
 
 import numpy as np
 from tqdm import tqdm
@@ -8,6 +9,13 @@ import jax.numpy as jnp
 
 import flax
 from flax import linen as nn
+
+from tokenizers import Tokenizer
+
+
+def shard(xs):
+    return jax.tree_map(
+        lambda x: x.reshape((jax.device_count(), -1) + x.shape[1:]), xs)
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -96,20 +104,33 @@ class GPT2(nn.Module):
 
 
 def main(args):
-    batch_size = 2
     seq_len = 128
     n_layers = 2
-    vocab_size = 1024
+    vocab_size = 30000
     d_model = 768
     n_heads = 8
 
     d_k = d_model // n_heads
 
+    tokenizer = Tokenizer.from_file('./tokenizer.json')
+    with open('./data.txt', 'r') as f:
+        text = f.read()
+    tokenized = tokenizer.encode(text)
+
+    batches = []
+    for i in tqdm(range(0, len(tokenized.tokens)-129, 129)):
+        batch = tokenized.ids[i:i+129]
+        batches.append(batch)
+
+        if i > 129*100:
+            break
+    batches = jnp.array(batches)
+
     rng = jax.random.PRNGKey(42)
-    x = jax.random.randint(rng, (batch_size, seq_len), 0, 1000, jnp.int32)
+    # x = jax.random.randint(rng, (args.batch_size, seq_len), 0, 1000, jnp.int32)
 
     variables = GPT2(seq_len, n_layers, vocab_size, d_model, n_heads).init(
-        {'params': rng, 'dropout': rng}, x, training=False)
+        {'params': rng, 'dropout': rng}, batches[:1, :128], training=False)
     gpt2 = GPT2(seq_len, n_layers, vocab_size, d_model, n_heads)
 
     def loss_fn(variables, batch, rng):
@@ -122,15 +143,15 @@ def main(args):
         loss = jnp.sum(y * jax.nn.log_softmax(y_hat, axis=-1), axis=-1)
         return -jnp.mean(loss)
 
-    # @partial(jax.pmap, axis_name='batch')
+    @partial(jax.pmap, axis_name='batch')
     def train_step(optimizer, batch, rng):
         rng, rng_dropout = jax.random.split(rng)
 
         loss, grad = jax.value_and_grad(loss_fn)(
             optimizer.target, batch, rng_dropout)
 
-        # loss = jax.lax.pmean(loss, axis_name='batch')
-        # grad = jax.lax.pmean(grad, axis_name='batch')
+        loss = jax.lax.pmean(loss, axis_name='batch')
+        grad = jax.lax.pmean(grad, axis_name='batch')
 
         optimizer = optimizer.apply_gradient(grad)
 
@@ -138,18 +159,35 @@ def main(args):
 
     optimizer = flax.optim.Adam(
         learning_rate=1e-4, beta1=0.5, beta2=0.9).create(variables)
-    x = jax.random.randint(rng, (batch_size, seq_len + 1), 0, 1000, jnp.int32)
+    optimizer = flax.jax_utils.replicate(optimizer)
 
-    for _ in tqdm(range(20)):
-        optimizer, loss, rng = train_step(optimizer, x, rng)
+    # batch = jax.random.randint(
+    #     rng, (args.batch_size, seq_len + 1), 0, 1000, jnp.int32)
 
-    print(loss)
+    rngs = jax.random.split(rng, num=jax.local_device_count())
+
+    global_step = 0
+    for _ in range(1):
+        for i in tqdm(range(batches.shape[0] // args.batch_size)):
+            batch = batches[i:i+args.batch_size]
+            x = shard(batch)
+
+            optimizer, loss, rngs = train_step(optimizer, x, rngs)
+
+            if global_step % 2 == 0:
+                loss = flax.jax_utils.unreplicate(loss)
+                print(loss)
+
+            global_step += 1
+
+    optimizer = flax.jax_utils.unreplicate(optimizer)
+    batch = flax.jax_utils.unreplicate(x)
 
     logits = gpt2.apply(
-        optimizer.target, x[:, :-1], training=True, rngs={'dropout': rng})
+        optimizer.target, batch[:, :-1], training=True, rngs={'dropout': rng})
     preds = jnp.argmax(nn.softmax(logits, axis=-1), axis=-1)
 
-    print(x[:, 1:])
+    print(batch[:, 1:])
     print("\n")
     print(preds)
 
