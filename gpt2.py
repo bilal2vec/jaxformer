@@ -89,7 +89,8 @@ class GPT2(nn.Module):
         position_ids = jnp.arange(start=0, stop=self.seq_len, step=1)
         mask = jnp.triu(jnp.ones((1, self.seq_len, self.seq_len)), k=1) == 0
 
-        embeddings = nn.Embed(self.vocab_size, self.d_model)(
+        content_embedding = nn.Embed(self.vocab_size, self.d_model)
+        embeddings = content_embedding(
             x) + nn.Embed(self.seq_len, self.d_model)(position_ids)
         x = nn.Dropout(0.1)(embeddings)
 
@@ -98,7 +99,7 @@ class GPT2(nn.Module):
                       self.n_heads)(x, mask, training)
 
         x = nn.LayerNorm()(x)
-        x = nn.Dense(self.vocab_size)(x)
+        x = content_embedding.attend(x)
 
         return x
 
@@ -165,7 +166,7 @@ def main():
 
             optimizer, loss, rngs = train_step(optimizer, x, rngs)
 
-            if global_step % 10 == 0:
+            if global_step % 100 == 0:
                 loss = flax.jax_utils.unreplicate(loss)
                 print(loss)
 
