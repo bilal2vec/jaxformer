@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import dataclass
 from functools import partial
 
 import numpy as np
@@ -78,25 +79,23 @@ class Block(nn.Module):
 
 
 class GPT2(nn.Module):
-    seq_len: int
-    n_layers: int
-    vocab_size: int
-    d_model: int
-    n_heads: int
+    config: dataclass
 
     @nn.compact
     def __call__(self, x, training=False):
-        position_ids = jnp.arange(start=0, stop=self.seq_len, step=1)
-        mask = jnp.triu(jnp.ones((1, self.seq_len, self.seq_len)), k=1) == 0
+        position_ids = jnp.arange(start=0, stop=self.config.seq_len, step=1)
+        mask = jnp.triu(
+            jnp.ones((1, self.config.seq_len, self.config.seq_len)), k=1) == 0
 
-        content_embedding = nn.Embed(self.vocab_size, self.d_model)
+        content_embedding = nn.Embed(
+            self.config.vocab_size, self.config.d_model)
         embeddings = content_embedding(
-            x) + nn.Embed(self.seq_len, self.d_model)(position_ids)
+            x) + nn.Embed(self.config.seq_len, self.config.d_model)(position_ids)
         x = nn.Dropout(0.1)(embeddings)
 
-        for _ in range(self.n_layers):
-            x = Block(self.seq_len, self.d_model,
-                      self.n_heads)(x, mask, training)
+        for _ in range(self.config.n_layers):
+            x = Block(self.config.seq_len, self.config.d_model,
+                      self.config.n_heads)(x, mask, training)
 
         x = nn.LayerNorm()(x)
         x = content_embedding.attend(x)
@@ -104,34 +103,32 @@ class GPT2(nn.Module):
         return x
 
 
-def main():
-    batch_size = 1
+def main(config):
+    batch_size = 8
     seq_len = 128
     n_layers = 2
-    vocab_size = 30000
+    vocab_size = 32768
     d_model = 768
     n_heads = 8
 
-    d_k = d_model // n_heads
-
     tokenizer = Tokenizer.from_file('./tokenizer.json')
-    with open('./data.txt', 'r') as f:
+    with open('./wikitext-2-raw/wiki.train.raw', 'r') as f:
         text = f.read()
     tokenized = tokenizer.encode(text)
     batches = jnp.array(tokenized.ids)
 
     rng = jax.random.PRNGKey(42)
 
-    variables = GPT2(seq_len, n_layers, vocab_size, d_model, n_heads).init(
+    variables = GPT2(config).init(
         {'params': rng, 'dropout': rng}, batches[:128].reshape(1, 128), training=False)
-    gpt2 = GPT2(seq_len, n_layers, vocab_size, d_model, n_heads)
 
     def loss_fn(variables, batch, rng):
         x = batch[:, :-1]
         y = batch[:, 1:]
-        y = jax.nn.one_hot(y, vocab_size)
+        y = jax.nn.one_hot(y, config.vocab_size)
 
-        y_hat = gpt2.apply(variables, x, training=True, rngs={'dropout': rng})
+        y_hat = GPT2(config).apply(
+            variables, x, training=True, rngs={'dropout': rng})
 
         loss = jnp.sum(y * jax.nn.log_softmax(y_hat, axis=-1), axis=-1)
         return -jnp.mean(loss)
@@ -150,6 +147,15 @@ def main():
 
         return optimizer, loss, rng
 
+    @partial(jax.pmap, axis_name='batch')
+    def eval_step(optimizer, batch, rng):
+        rng, rng_dropout = jax.random.split(rng)
+
+        loss = loss_fn(optimizer.target, batch, rng_dropout)
+        loss = jax.lax.pmean(loss, axis_name='batch')
+
+        return loss, rng
+
     optimizer = flax.optim.Adam(
         learning_rate=1e-4, beta1=0.5, beta2=0.9).create(variables)
     optimizer = flax.jax_utils.replicate(optimizer)
@@ -157,11 +163,10 @@ def main():
     rngs = jax.random.split(rng, num=jax.local_device_count())
 
     global_step = 0
-    for _ in range(1):
-        for i in tqdm(range(0, batches.shape[0] // ((seq_len+1)*batch_size))):
-            batch = batches[i*(seq_len+1)*batch_size:(i+1)
-                            * (seq_len+1)*batch_size].reshape(-1, seq_len+1)
-
+    for _ in range(config.epochs):
+        for i in tqdm(range(0, batches.shape[0] // ((config.seq_len+1)*config.batch_size))):
+            batch = batches[i*(config.seq_len+1)*config.batch_size:(i+1)
+                            * (config.seq_len+1)*config.batch_size].reshape(-1, config.seq_len+1)
             x = shard(batch)
 
             optimizer, loss, rngs = train_step(optimizer, x, rngs)
@@ -172,24 +177,71 @@ def main():
 
             global_step += 1
 
+            if args.fast:
+                break
+
+    with open('./wikitext-2-raw/wiki.test.raw', 'r') as f:
+        text = f.read()
+    tokenized = tokenizer.encode(text)
+    test_batches = jnp.array(tokenized.ids)
+
+    test_loss = 0
+    for i in tqdm(range(0, test_batches.shape[0] // ((config.seq_len+1)*config.batch_size))):
+        batch = test_batches[i*(config.seq_len+1)*config.batch_size:(i+1) *
+                             (config.seq_len+1)*config.batch_size].reshape(-1, config.seq_len+1)
+        x = shard(batch)
+
+        loss, rngs = eval_step(optimizer, x, rngs)
+        loss = flax.jax_utils.unreplicate(loss)
+
+        test_loss += loss
+
+        if args.fast:
+            break
+
+    test_loss /= (i + 1)
+    print(f'Test Loss: {test_loss}')
+    print('\n')
+
     optimizer = flax.jax_utils.unreplicate(optimizer)
-    batch = flax.jax_utils.unreplicate(x)
 
-    logits = gpt2.apply(
-        optimizer.target, batches[:seq_len].reshape(1, seq_len), training=True, rngs={'dropout': rng})
-    preds = jnp.argmax(nn.softmax(logits, axis=-1), axis=-1)
+    generated = list(batches[:config.seq_len].reshape(-1))
 
-    print(tokenizer.decode(batches[:seq_len]))
+    for i in tqdm(range(config.seq_len)):
+        rng, _ = jax.random.split(rng, 2)
+
+        x = jnp.array(generated).reshape(1, -1)
+        logits = GPT2(config).apply(
+            variables, x, training=False, rngs={'dropout': rng})
+        preds = nn.softmax(logits, axis=-1)
+
+        next_token = jax.random.categorical(rng, preds[0, -1])
+        generated = generated[1:] + [int(next_token)]
+
+    print(f'Dataset: {tokenizer.decode(batches[:config.seq_len])}')
     print("\n")
-    print(tokenizer.decode(preds.reshape(-1)))
+    print(f'Continuation: {tokenizer.decode(generated)}')
+
+
+@dataclass
+class Config:
+    fast: bool = False
+
+    batch_size: int = 1
+    epochs: int = 1
+
+    seq_len: int = 128
+    n_layers: int = 2
+    vocab_size: int = 32768
+    d_model: int = 768
+    n_heads: int = 8
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--debug', default=False, action="store_true")
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--fast', default=False, action="store_true")
 
     args = parser.parse_args()
 
@@ -200,4 +252,5 @@ if __name__ == "__main__":
         ptvsd.wait_for_attach()
         breakpoint()
 
-    main()
+    config = Config(fast=args.fast)
+    main(config)
