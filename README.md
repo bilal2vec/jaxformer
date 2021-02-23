@@ -4,8 +4,10 @@
 
 -   eval
     -   proper sampling
+-   model parameters
 -   logging
 -   saving
+-   https://github.com/google-research/google-research/tree/master/flax_models/t5x
 
 # ideas
 

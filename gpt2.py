@@ -20,7 +20,6 @@ def shard(xs):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    seq_len: int
     d_model: int
     n_heads: int
 
@@ -46,7 +45,7 @@ class MultiHeadSelfAttention(nn.Module):
         a = nn.Dropout(0.1)(a, deterministic=not training)
         a = jnp.matmul(a, v)
 
-        return a.transpose((0, 2, 1, 3)).reshape(-1, self.seq_len, self.d_model)
+        return a.transpose((0, 2, 1, 3)).reshape(-1, seq_len, self.d_model)
 
 
 class MLP(nn.Module):
@@ -63,14 +62,13 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    seq_len: int
     d_model: int
     n_heads: int
 
     @nn.compact
     def __call__(self, x, mask, training):
 
-        x = x + MultiHeadSelfAttention(self.seq_len, self.d_model,
+        x = x + MultiHeadSelfAttention(self.d_model,
                                        self.n_heads)(nn.LayerNorm()(x), mask, training)
         x = x + nn.Dropout(0.1)(MLP(self.d_model)(nn.LayerNorm()
                                                   (x), training), deterministic=not training)
@@ -83,19 +81,21 @@ class GPT2(nn.Module):
 
     @nn.compact
     def __call__(self, x, training=False):
-        position_ids = jnp.arange(start=0, stop=self.config.seq_len, step=1)
+        seq_len = x.shape[-1]
+
+        position_ids = jnp.arange(start=0, stop=seq_len, step=1)
         mask = jnp.triu(
-            jnp.ones((1, self.config.seq_len, self.config.seq_len)), k=1) == 0
+            jnp.ones((1, seq_len, seq_len)), k=1) == 0
 
         content_embedding = nn.Embed(
             self.config.vocab_size, self.config.d_model)
         embeddings = content_embedding(
-            x) + nn.Embed(self.config.seq_len, self.config.d_model)(position_ids)
+            x) + nn.Embed(self.config.max_seq_len, self.config.d_model)(position_ids)
         x = nn.Dropout(0.1)(embeddings)
 
         for _ in range(self.config.n_layers):
-            x = Block(self.config.seq_len, self.config.d_model,
-                      self.config.n_heads)(x, mask, training)
+            x = Block(self.config.d_model, self.config.n_heads)(
+                x, mask, training)
 
         x = nn.LayerNorm()(x)
         x = content_embedding.attend(x)
@@ -103,14 +103,21 @@ class GPT2(nn.Module):
         return x
 
 
-def main(config):
-    batch_size = 8
-    seq_len = 128
-    n_layers = 2
-    vocab_size = 32768
-    d_model = 768
-    n_heads = 8
+@dataclass
+class Config:
+    fast: bool = False
 
+    batch_size: int = 1
+    epochs: int = 1
+
+    max_seq_len: int = 128
+    n_layers: int = 2
+    vocab_size: int = 32768
+    d_model: int = 768
+    n_heads: int = 8
+
+
+def main(config):
     tokenizer = Tokenizer.from_file('./tokenizer.json')
     with open('./wikitext-2-raw/wiki.train.raw', 'r') as f:
         text = f.read()
@@ -164,9 +171,9 @@ def main(config):
 
     global_step = 0
     for _ in range(config.epochs):
-        for i in tqdm(range(0, batches.shape[0] // ((config.seq_len+1)*config.batch_size))):
-            batch = batches[i*(config.seq_len+1)*config.batch_size:(i+1)
-                            * (config.seq_len+1)*config.batch_size].reshape(-1, config.seq_len+1)
+        for i in tqdm(range(0, batches.shape[0] // ((config.max_seq_len+1)*config.batch_size))):
+            batch = batches[i*(config.max_seq_len+1)*config.batch_size:(i+1)
+                            * (config.max_seq_len+1)*config.batch_size].reshape(-1, config.max_seq_len+1)
             x = shard(batch)
 
             optimizer, loss, rngs = train_step(optimizer, x, rngs)
@@ -186,9 +193,9 @@ def main(config):
     test_batches = jnp.array(tokenized.ids)
 
     test_loss = 0
-    for i in tqdm(range(0, test_batches.shape[0] // ((config.seq_len+1)*config.batch_size))):
-        batch = test_batches[i*(config.seq_len+1)*config.batch_size:(i+1) *
-                             (config.seq_len+1)*config.batch_size].reshape(-1, config.seq_len+1)
+    for i in tqdm(range(0, test_batches.shape[0] // ((config.max_seq_len+1)*config.batch_size))):
+        batch = test_batches[i*(config.max_seq_len+1)*config.batch_size:(i+1) *
+                             (config.max_seq_len+1)*config.batch_size].reshape(-1, config.max_seq_len+1)
         x = shard(batch)
 
         loss, rngs = eval_step(optimizer, x, rngs)
@@ -205,9 +212,8 @@ def main(config):
 
     optimizer = flax.jax_utils.unreplicate(optimizer)
 
-    generated = list(batches[:config.seq_len].reshape(-1))
-
-    for i in tqdm(range(config.seq_len)):
+    generated = tokenizer.encode(' ').ids
+    for i in tqdm(range(config.max_seq_len)):
         rng, _ = jax.random.split(rng, 2)
 
         x = jnp.array(generated).reshape(1, -1)
@@ -216,25 +222,11 @@ def main(config):
         preds = nn.softmax(logits, axis=-1)
 
         next_token = jax.random.categorical(rng, preds[0, -1])
-        generated = generated[1:] + [int(next_token)]
+        generated += [int(next_token)]
 
-    print(f'Dataset: {tokenizer.decode(batches[:config.seq_len])}')
+    print(f'Dataset: {tokenizer.decode(batches[:config.max_seq_len])}')
     print("\n")
     print(f'Continuation: {tokenizer.decode(generated)}')
-
-
-@dataclass
-class Config:
-    fast: bool = False
-
-    batch_size: int = 1
-    epochs: int = 1
-
-    seq_len: int = 128
-    n_layers: int = 2
-    vocab_size: int = 32768
-    d_model: int = 768
-    n_heads: int = 8
 
 
 if __name__ == "__main__":
