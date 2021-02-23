@@ -1,4 +1,4 @@
-# jaxpt2
+# jaxformer
 
 # todo
 

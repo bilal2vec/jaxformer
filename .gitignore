@@ -22,3 +22,5 @@ package-lock.json
 *.synctex.gz
 
 *.lock
+
+.DS_Store
