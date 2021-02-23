@@ -2,8 +2,6 @@
 
 # todo
 
--   eval
-    -   proper sampling
 -   model parameters
 -   logging
 -   saving
@@ -45,11 +43,13 @@
 -   tie input/output embedding weights
     -   make a custom embedding/dense layer
     -   turns out flax embeddings have a `.attend()` method just for this
+-   eval
+    -   proper sampling
 
 # tokenizer
 
 ```python
-from tokenizers import ByteLevelBPETokenizer
+from tokenizers import Tokenizer, ByteLevelBPETokenizer
 
 files = [f"./wikitext-2-raw/wiki.{split}.raw" for split in ["test", "train", "valid"]]
 
