@@ -7,37 +7,6 @@
 -   saving
 -   https://github.com/google-research/google-research/tree/master/flax_models/t5x
 
-# ideas
-
--   "standard" model sizes
--   robust tokenization/dataloading
-    -   huggingface datasets?
--   attention
-    -   efficient attention
-    -   recurrence
--   training
-    -   AMP
-    -   checkpointing
-    -   accumulation
-    -   revnets
-    -   memory swapping
--   post-training
-    -   distillation
-    -   pruning/lottery ticket
-    -   quantization
--   parallelism
-    -   model
-    -   pipeline
-    -   deepspeed/zero/offload/1bitadam
-    -   fusedadam
--   encoder/decoder/encoder-decoder
--   weight sharing
--   nfnet
--   alternatives to autoregressive LM
--   multimodal
--   vqvae/gans
--   optimizer
-
 # done
 
 -   tie input/output embedding weights
