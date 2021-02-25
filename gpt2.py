@@ -103,20 +103,6 @@ class GPT2(nn.Module):
         return x
 
 
-@dataclass
-class Config:
-    fast: bool = False
-
-    batch_size: int = 1
-    epochs: int = 1
-
-    max_seq_len: int = 128
-    n_layers: int = 2
-    vocab_size: int = 32768
-    d_model: int = 768
-    n_heads: int = 8
-
-
 def main(config):
     tokenizer = Tokenizer.from_file('./tokenizer.json')
     with open('./wikitext-2-raw/wiki.train.raw', 'r') as f:
@@ -213,20 +199,33 @@ def main(config):
     optimizer = flax.jax_utils.unreplicate(optimizer)
 
     generated = tokenizer.encode(' ').ids
-    for i in tqdm(range(config.max_seq_len)):
+    for i in tqdm(range(config.sample_len)):
         rng, _ = jax.random.split(rng, 2)
 
         x = jnp.array(generated).reshape(1, -1)
         logits = GPT2(config).apply(
-            variables, x, training=False, rngs={'dropout': rng})
-        preds = nn.softmax(logits, axis=-1)
-
-        next_token = jax.random.categorical(rng, preds[0, -1])
+            optimizer.target, x, training=False, rngs={'dropout': rng})
+        next_token = jax.random.categorical(rng, logits[0, 0])
         generated += [int(next_token)]
 
     print(f'Dataset: {tokenizer.decode(batches[:config.max_seq_len])}')
     print("\n")
     print(f'Continuation: {tokenizer.decode(generated)}')
+
+
+@dataclass
+class Config:
+    fast: bool = False
+
+    batch_size: int = 256
+    epochs: int = 30
+    sample_len: int = 16
+
+    max_seq_len: int = 128
+    n_layers: int = 2
+    vocab_size: int = 32768
+    d_model: int = 768
+    n_heads: int = 8
 
 
 if __name__ == "__main__":
