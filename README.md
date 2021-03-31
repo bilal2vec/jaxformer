@@ -31,3 +31,7 @@ tokenizer = Tokenizer.from_file('./tokenizer.json')
 tokenizer.encode('Hello, my name is bilal').tokens
 tokenizer.decode(tokenizer.encode('Hello, my name is bilal').ids)
 ```
+
+# acknowledgements
+
+a _lot_ of the model parallel code is copied over from ben wang's [repo](https://github.com/kingoflolz/mesh-transformer-jax) repo.

@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.maps import xmap
 
 import flax
 from flax import linen as nn
@@ -14,27 +15,59 @@ from flax import linen as nn
 from tokenizers import Tokenizer
 
 
-def shard(xs):
-    return jax.tree_map(
-        lambda x: x.reshape((jax.device_count(), -1) + x.shape[1:]), xs)
+@jax.custom_vjp
+def f_psum(x):
+    return x
+
+
+def f_psum_fwd(x):
+    return f_psum(x), None
+
+
+def f_psum_bwd(_, g):
+    return jax.lax.psum(g, "shard"),
+
+
+@jax.custom_vjp
+def g_psum(x):
+    return jax.lax.psum(x, "shard")
+
+
+def g_psum_fwd(x):
+    return g_psum(x), None
+
+
+def g_psum_bwd(_, g):
+    return g,
+
+
+f_psum.defvjp(f_psum_fwd, f_psum_bwd)
+g_psum.defvjp(g_psum_fwd, g_psum_bwd)
 
 
 class MultiHeadSelfAttention(nn.Module):
-    d_model: int
-    n_heads: int
+    config: dataclass
 
     @nn.compact
-    def __call__(self, x, mask, training):
-        seq_len = x.shape[1]
-        d_k = self.d_model // self.n_heads
+    def __call__(self, x, mask):
+        batch, seq_len, d_model = x.shape
 
-        q = nn.Dense(self.d_model)(x)
-        k = nn.Dense(self.d_model)(x)
-        v = nn.Dense(self.d_model)(x)
+        d_model_mp = d_model // config.mp
+        d_k = d_model_mp // config.n_heads
 
-        q = q.reshape((-1, seq_len, self.n_heads, d_k)).transpose((0, 2, 1, 3))
-        k = k.reshape((-1, seq_len, self.n_heads, d_k)).transpose((0, 2, 1, 3))
-        v = v.reshape((-1, seq_len, self.n_heads, d_k)).transpose((0, 2, 1, 3))
+        x = f_psum(x)
+
+        q = nn.Dense(d_model_mp)(x)
+        k = nn.Dense(d_model_mp)(x)
+        v = nn.Dense(d_model_mp)(x)
+
+        # batch x n_heads x seq_len x d_k
+        q = q.reshape((-1, seq_len, config.n_heads, d_k)
+                      ).transpose((0, 2, 1, 3))
+        k = k.reshape((-1, seq_len, config.n_heads, d_k)
+                      ).transpose((0, 2, 1, 3))
+        v = v.reshape((-1, seq_len, config.n_heads, d_k)
+                      ).transpose((0, 2, 1, 3))
 
         a = jnp.matmul(q, k.transpose((0, 1, 3, 2))) / jnp.sqrt(d_k)
 
@@ -42,36 +75,42 @@ class MultiHeadSelfAttention(nn.Module):
         a += mask
 
         a = nn.softmax(a, axis=-1)
-        a = nn.Dropout(0.1)(a, deterministic=not training)
         a = jnp.matmul(a, v)
 
-        return a.transpose((0, 2, 1, 3)).reshape(-1, seq_len, self.d_model)
+        # batch x seq_len x n_heads x d_k
+        # batch x seq_len x d_model_mp
+        a = a.transpose((0, 2, 1, 3)).reshape(-1, seq_len, d_model_mp)
+
+        o = nn.Dense(d_model)(a)
+        o = g_psum(o)
+
+        return o
 
 
 class MLP(nn.Module):
-    d_model: int
+    config: dataclass
 
     @nn.compact
-    def __call__(self, x, training):
-        x = nn.Dense(self.d_model * 4)(x)
+    def __call__(self, x):
+        x = f_psum(x)
+
+        x = nn.Dense((self.config.d_model // self.config.mp) * 4)(x)
         x = nn.gelu(x)
-        x = nn.Dense(self.d_model)(x)
-        x = nn.Dropout(0.1)(x, deterministic=not training)
+        x = nn.Dense(self.config.d_model)(x)
+
+        x = g_psum(x)
 
         return x
 
 
 class Block(nn.Module):
-    d_model: int
-    n_heads: int
+    config: dataclass
 
     @nn.compact
-    def __call__(self, x, mask, training):
+    def __call__(self, x, mask):
 
-        x = x + MultiHeadSelfAttention(self.d_model,
-                                       self.n_heads)(nn.LayerNorm()(x), mask, training)
-        x = x + nn.Dropout(0.1)(MLP(self.d_model)(nn.LayerNorm()
-                                                  (x), training), deterministic=not training)
+        x = x + MultiHeadSelfAttention(self.config)(nn.LayerNorm()(x), mask)
+        x = x + MLP(self.config)(nn.LayerNorm()(x))
 
         return x
 
@@ -80,7 +119,7 @@ class GPT2(nn.Module):
     config: dataclass
 
     @nn.compact
-    def __call__(self, x, training=False):
+    def __call__(self, x):
         seq_len = x.shape[-1]
 
         position_ids = jnp.arange(start=0, stop=seq_len, step=1)
@@ -89,13 +128,11 @@ class GPT2(nn.Module):
 
         content_embedding = nn.Embed(
             self.config.vocab_size, self.config.d_model)
-        embeddings = content_embedding(
+        x = content_embedding(
             x) + nn.Embed(self.config.max_seq_len, self.config.d_model)(position_ids)
-        x = nn.Dropout(0.1)(embeddings)
 
         for _ in range(self.config.n_layers):
-            x = Block(self.config.d_model, self.config.n_heads)(
-                x, mask, training)
+            x = Block(config)(x, mask)
 
         x = nn.LayerNorm()(x)
         x = content_embedding.attend(x)
@@ -112,59 +149,57 @@ def main(config):
 
     rng = jax.random.PRNGKey(42)
 
-    variables = GPT2(config).init(
-        {'params': rng, 'dropout': rng}, batches[:128].reshape(1, 128), training=False)
+    @partial(xmap, in_axes=(["shard", ...], ["batch", ...]), out_axes=["shard", ...])
+    def initialize(rng, init_batch):
+        variables = GPT2(Config).init({'params': rng}, init_batch)
+        optimizer = flax.optim.Adam(
+            learning_rate=1e-4, beta1=0.5, beta2=0.9).create(variables)
 
-    def loss_fn(variables, batch, rng):
+        return optimizer
+
+    def loss_fn(variables, batch):
         x = batch[:, :-1]
         y = batch[:, 1:]
         y = jax.nn.one_hot(y, config.vocab_size)
 
-        y_hat = GPT2(config).apply(
-            variables, x, training=True, rngs={'dropout': rng})
+        y_hat = GPT2(config).apply(variables, x)
 
         loss = jnp.sum(y * jax.nn.log_softmax(y_hat, axis=-1), axis=-1)
         return -jnp.mean(loss)
 
-    @partial(jax.pmap, axis_name='batch')
-    def train_step(optimizer, batch, rng):
-        rng, rng_dropout = jax.random.split(rng)
+    @partial(xmap, in_axes=(["shard", ...], ["batch", ...]), out_axes=(["shard", ...], ["batch", ...]))
+    def train_step(optimizer, batch):
+        loss, grad = jax.value_and_grad(loss_fn)(optimizer.target, batch)
 
-        loss, grad = jax.value_and_grad(loss_fn)(
-            optimizer.target, batch, rng_dropout)
-
-        loss = jax.lax.pmean(loss, axis_name='batch')
-        grad = jax.lax.pmean(grad, axis_name='batch')
+        loss = jax.lax.pmean(loss, axis_name=['shard'])
+        grad = jax.lax.pmean(grad, axis_name=['batch'])
 
         optimizer = optimizer.apply_gradient(grad)
 
-        return optimizer, loss, rng
+        return optimizer, loss
 
-    @partial(jax.pmap, axis_name='batch')
-    def eval_step(optimizer, batch, rng):
-        rng, rng_dropout = jax.random.split(rng)
+    @partial(xmap, in_axes=(["shard", ...], ["batch", ...]), out_axes=(["batch", ...]))
+    def eval_step(optimizer, batch):
+        loss = loss_fn(optimizer.target, batch)
+        loss = jax.lax.pmean(loss, axis_name='shard')
 
-        loss = loss_fn(optimizer.target, batch, rng_dropout)
-        loss = jax.lax.pmean(loss, axis_name='batch')
+        return loss
 
-        return loss, rng
+    rngs = jax.random.split(rng, num=config.mp)
+    init_batches = jnp.zeros((config.dp, 1, 128), dtype=int)
 
-    optimizer = flax.optim.Adam(
-        learning_rate=1e-4, beta1=0.5, beta2=0.9).create(variables)
-    optimizer = flax.jax_utils.replicate(optimizer)
-
-    rngs = jax.random.split(rng, num=jax.local_device_count())
+    optimizer = initialize(rngs, init_batches)
 
     global_step = 0
     for _ in range(config.epochs):
         for i in tqdm(range(0, batches.shape[0] // ((config.max_seq_len+1)*config.batch_size))):
             batch = batches[i*(config.max_seq_len+1)*config.batch_size:(i+1)
                             * (config.max_seq_len+1)*config.batch_size].reshape(-1, config.max_seq_len+1)
-            x = shard(batch)
+            batch = batch.reshape(config.dp, batch.shape[0], batch.shape[1])
 
-            optimizer, loss, rngs = train_step(optimizer, x, rngs)
+            optimizer, loss = train_step(optimizer, batch)
 
-            if global_step % 100 == 0:
+            if global_step % 10 == 0:
                 loss = flax.jax_utils.unreplicate(loss)
                 print(loss)
 
@@ -182,10 +217,9 @@ def main(config):
     for i in tqdm(range(0, test_batches.shape[0] // ((config.max_seq_len+1)*config.batch_size))):
         batch = test_batches[i*(config.max_seq_len+1)*config.batch_size:(i+1) *
                              (config.max_seq_len+1)*config.batch_size].reshape(-1, config.max_seq_len+1)
-        x = shard(batch)
+        batch = batch.reshape(config.dp, batch.shape[0], batch.shape[1])
 
-        loss, rngs = eval_step(optimizer, x, rngs)
-        loss = flax.jax_utils.unreplicate(loss)
+        loss = eval_step(optimizer, batch)
 
         test_loss += loss
 
@@ -196,28 +230,31 @@ def main(config):
     print(f'Test Loss: {test_loss}')
     print('\n')
 
-    optimizer = flax.jax_utils.unreplicate(optimizer)
+    # optimizer = flax.jax_utils.unreplicate(optimizer)
 
-    generated = tokenizer.encode(' ').ids
-    for i in tqdm(range(config.sample_len)):
-        rng, _ = jax.random.split(rng, 2)
+    # generated = tokenizer.encode(' ').ids
+    # for i in tqdm(range(config.sample_len)):
+    #     rng, _ = jax.random.split(rng, 2)
 
-        x = jnp.array(generated).reshape(1, -1)
-        logits = GPT2(config).apply(
-            optimizer.target, x, training=False, rngs={'dropout': rng})
-        next_token = jax.random.categorical(rng, logits[0, 0])
-        generated += [int(next_token)]
+    #     x = jnp.array(generated).reshape(1, -1)
+    #     logits = GPT2(config).apply(
+    #         optimizer.target, x, training=False, rngs={'dropout': rng})
+    #     next_token = jax.random.categorical(rng, logits[0, 0])
+    #     generated += [int(next_token)]
 
-    print(f'Dataset: {tokenizer.decode(batches[:config.max_seq_len])}')
-    print("\n")
-    print(f'Continuation: {tokenizer.decode(generated)}')
+    # print(f'Dataset: {tokenizer.decode(batches[:config.max_seq_len])}')
+    # print("\n")
+    # print(f'Continuation: {tokenizer.decode(generated)}')
 
 
 @dataclass
 class Config:
     fast: bool = False
 
-    batch_size: int = 256
+    mp: int = 1
+    dp: int = 1
+
+    batch_size: int = 1
     epochs: int = 30
     sample_len: int = 16
 
